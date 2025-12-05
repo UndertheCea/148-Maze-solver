@@ -36,7 +36,7 @@ void mazeDrive() {
     Serial.printf("FrontDist=%.1f, count=%d\n", frontDist, count);
 
     int8_t X = 0, Y = 0; uint8_t A = 0;
-    const int speed = 4;  // small number, works with ControlWheel
+    const int speed = 2;  // small number, works with ControlWheel
 
     if (count == 0 || frontDist > 150) {
         Serial.println("Path is clear");
@@ -47,7 +47,7 @@ void mazeDrive() {
         Y = 0;
     }
 
-    sendControlCommand(0, 3, 0);
+    sendControlCommand(X, Y, 0);
 }
 
 // ==================== Tasks ====================
@@ -56,7 +56,7 @@ static void mazeTask(void *arg) {
         if (mazeMode) {
             mazeDrive();
         }
-        delay(10);
+        delay(50);
     }
 }
 
@@ -74,6 +74,7 @@ void setup() {
     Serial.begin(115200);
     M5.begin(true, false, true);
     Serial1.begin(115200, SERIAL_8N1, 16, 17);
+    Serial2.begin(115200);
 
     //lidarcar.begin();
 
