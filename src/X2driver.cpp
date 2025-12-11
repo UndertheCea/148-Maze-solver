@@ -77,7 +77,7 @@ void X2::lidar_data_deal(uint8_t data_in) {
       else {
         //crc error or startAng < endAng
         //we can see which angle is error here.
-        Serial.printf("startAngle: %f, endAngle: %f \r\n", startAngle / 64, endAngle / 64);
+        //Serial.printf("startAngle: %f, endAngle: %f \r\n", startAngle / 64, endAngle / 64);
       }
     }
     memset(rx_buf, 0, rx_ptr);
