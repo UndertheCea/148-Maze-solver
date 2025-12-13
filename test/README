@@ -1,3 +1,132 @@
+# X2 LidarBot Maze Solver
+
+An autonomous maze-solving robot built with M5Stack and X2 LiDAR sensor, implementing a right-hand wall-following algorithm with intelligent path detection.
+
+## Hardware Requirements
+
+- **M5Stack Core** - Main controller
+- **X2 LiDAR Sensor** - 360° distance sensing (connected via Serial1, pins 16/17)
+- **LidarCar Base** - Motor control platform 
+
+## Features
+
+### Core Functionality
+- **Autonomous Maze Navigation** - Right-hand wall-following algorithm
+- **360° LiDAR Mapping** - Real-time environment visualization on M5Stack display
+- **Reflective Exit Detection** - Automatically detects maze completion using reflective markers
+- **Data Filtering** - Interpolation algorithm removes noise and invalid readings
+
+### Navigation Logic
+The robot prioritizes paths in this order:
+1. **Right turn** (when available)
+2. **Forward** (if right is blocked)
+3. **Left turn** (if right and forward blocked)
+4. **U-turn** (dead end)
+
+### Control Modes
+
+#### Manual Control
+Navigate manually using keyboard commands:
+- `W` - Forward
+- `S` - Backward
+- `A` - Turn left
+- `D` - Turn right
+- `X` - Stop
+
+#### Maze Mode
+- `M` - Toggle autonomous maze solving on/off
+- Robot automatically navigates using wall-following algorithm
+
+#### Calibration Mode
+- `C` - Enter turn calibration
+  - `1` - Test right 90° turn
+  - `2` - Test left 90° turn
+  - `3` - Test 180° turn
+  - `+` - Increase turn duration by 100ms
+  - `-` - Decrease turn duration by 100ms
+  - `S` - Show current calibration values
+  - `Q` - Exit calibration
+
+## Configuration Parameters
+
+### Detection Thresholds
+```cpp
+threshold_front = 105.0mm    // Minimum distance to consider path open ahead
+threshhold_sides = 150.0mm   // Minimum distance for left/right openings
+```
+
+### Turn Durations (calibrate for your robot)
+```cpp
+turnDuration90Right = 2200ms
+turnDuration90Left = 2200ms
+turnDuration180 = 4300ms
+```
+
+### LiDAR Scanning Zones
+- **Front**: 155° - 195° (indexes 310-390)
+- **Left**: 70° - 116.5° (indexes 140-233)
+- **Right**: 252.5° - 290° (indexes 505-580)
+
+### Exit Detection
+- Detects reflective surfaces > 4000mm
+- Requires 15+ consecutive readings
+- Needs 2 consecutive detection cycles to confirm
+
+## Algorithm Details
+
+### Data Cleaning
+The `cleanLidarData()` function interpolates invalid readings using adjacent valid data points within a 2-index gap, filtering values outside the 80-8000mm range.
+
+### U-Turn Prevention
+After executing a right turn or U-turn, the robot ignores right-turn opportunities for 2 seconds to prevent immediate backtracking.
+
+### Maze Exit Detection
+Uses reflective tape or markers at the exit. When the LiDAR detects highly reflective surfaces (>4000mm readings) across the front scanning zone, it confirms maze completion.
+
+## Display Features
+
+- **Real-time LiDAR visualization** - Polar plot showing detected obstacles
+- **Robot position** - Red dot at center
+
+## Getting Started
+
+1. **Upload the code** to your M5Stack
+2. **Calibrate turns** using `C` command for accurate 90° and 180° rotations
+3. **Position robot** at maze entrance
+4. **Press M** to start autonomous solving
+5. **Robot stops automatically** when reflective exit is detected
+
+## Technical Architecture
+
+### Serial Communication
+- **Serial** (115200) - Debug output and keyboard control
+- **Serial1** (115200, pins 16/17) - X2 LiDAR data
+- **Serial2** (115200) - Motor control commands
+
+## Maze Design Requirements
+
+- Wall separation: >105mm front, >150mm sides for reliable detection
+- **Exit marker**: Reflective tape or surface at maze exit
+- Recommended: Smooth walls without gaps for consistent LiDAR readings
+
+## Troubleshooting
+
+**Robot doesn't turn accurately**
+- Run calibration mode (`C`) and adjust turn durations
+
+**Fails to detect openings**
+- Check threshold values match your maze dimensions
+- Verify LiDAR is functioning (use `P` to print distances)
+
+**Doesn't detect exit**
+- Ensure reflective marker is present and visible to front sensors
+- Check REFLECTIVE_THRESHOLD value (currently 4000mm)
+
+**Erratic behavior**
+- Verify Serial1 connections (pins 16/17)
+- Check that LidarCar is receiving commands on Serial2
+
+
 
 This directory is intended for PlatformIO Test Runner and project tests.
 
