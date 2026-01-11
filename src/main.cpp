@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
+#include <math.h>
 
 #define FRONT_ANGLE 360
 #define TFT_GREY 0x5AEB
@@ -11,6 +12,156 @@
 
 enum Heading { NORTH, EAST, SOUTH, WEST };
 Heading heading = NORTH;
+
+// ---------- Grid params (tune) ----------
+static const int MAP_W = 150;          // cells
+static const int MAP_H = 150;          // cells
+static const float RES_MM = 50.0f;     // mm per cell (50mm => 8m x 8m)
+
+// Robot starts at center of grid
+static const int ORIGIN_X = MAP_W / 2;
+static const int ORIGIN_Y = MAP_H / 2;
+
+// ---------- Log-odds fixed-point ----------
+static const int LO_SCALE = 1000;
+static const int16_t LO_MIN = -3000;
+static const int16_t LO_MAX =  3000;
+
+// Sensor model probabilities (tune)
+static const float P_OCC  = 0.70f;     // endpoint occupied
+static const float P_FREE = 0.30f;     // ray cells free
+
+// Threshold later for A* (occupied if > this)
+static const int16_t LO_OCC_THRESH = 800;
+
+// Lidar validity (match your cleaning)
+static const float LIDAR_MIN_MM = 80.0f;
+static const float LIDAR_MAX_MM = 8000.0f;
+static const float NO_HIT_MARGIN_MM = 80.0f;
+
+// Downsample beams for speed: 2 => 1deg, 4 => 2deg
+static const int BEAM_STEP = 2;
+
+// The map: log-odds grid
+static int16_t logOdds[MAP_H][MAP_W];
+
+// Pose (mm) in world frame: +x east, +y north
+static float robot_x_mm = 0.0f;
+static float robot_y_mm = 0.0f;
+
+// TODO
+// Timestamp-based translation tuning (IMPORTANT to calibrate)
+static float MM_PER_MS_FWD = 0.35f;  // forward mm per ms
+static float MM_PER_MS_REV = 0.30f;  // backward mm per ms
+
+// Track last commanded motion for integration
+static int8_t lastCmdY = 0;
+static unsigned long lastCmdTime = 0;
+
+// Thread safety for lidar array snapshot (mazeTask reads while lidarTask writes)
+static portMUX_TYPE lidarMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Precomputed log-odds deltas
+static int16_t LO_OCC_DELTA;
+static int16_t LO_FREE_DELTA;
+
+// Heading enum -> radians (0=east, +90=north)
+static inline float headingToThetaRad(Heading h) {
+  switch (h) {
+    case EAST:  return 0.0f;
+    case NORTH: return PI * 0.5f;
+    case WEST:  return PI;
+    case SOUTH: return -PI * 0.5f;
+  }
+  return 0.0f;
+}
+
+// World mm -> grid cell
+static inline bool worldToGrid(float x_mm, float y_mm, int &gx, int &gy) {
+  gx = ORIGIN_X + (int)floorf(x_mm / RES_MM);
+  gy = ORIGIN_Y - (int)floorf(y_mm / RES_MM); // y+ north; row index grows downward
+  return (gx >= 0 && gx < MAP_W && gy >= 0 && gy < MAP_H);
+}
+
+// Clamp + add delta to a cell
+static inline void addLogOdds(int gx, int gy, int16_t delta) {
+  if (gx < 0 || gx >= MAP_W || gy < 0 || gy >= MAP_H) return;
+  int v = (int)logOdds[gy][gx] + (int)delta;
+  if (v > LO_MAX) v = LO_MAX;
+  if (v < LO_MIN) v = LO_MIN;
+  logOdds[gy][gx] = (int16_t)v;
+}
+
+// p -> log-odds fixed-point
+static inline int16_t probToLogOddsDelta(float p) {
+  float l = logf(p / (1.0f - p));
+  return (int16_t)(l * (float)LO_SCALE);
+}
+// Bresenham ray: mark free along path, occ at endpoint if hit==true
+static void updateRay(int x0, int y0, int x1, int y1, bool hit) {
+  int dx = abs(x1 - x0), sx = (x0 < x1) ? 1 : -1;
+  int dy = -abs(y1 - y0), sy = (y0 < y1) ? 1 : -1;
+  int err = dx + dy;
+
+  bool first = true;
+
+  while (true) {
+    if (x0 == x1 && y0 == y1) break;
+
+    int e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+
+    if (x0 < 0 || x0 >= MAP_W || y0 < 0 || y0 >= MAP_H) return;
+
+    // skip robot cell itself
+    if (!first) {
+      if (x0 == x1 && y0 == y1) break; // endpoint handled below
+      addLogOdds(x0, y0, LO_FREE_DELTA);
+    }
+    first = false;
+  }
+
+  if (hit) addLogOdds(x1, y1, LO_OCC_DELTA);
+}
+// Process one 720-beam scan -> update logOdds
+static void updateMapFromScan(const float *scan720) {
+  int rx, ry;
+  if (!worldToGrid(robot_x_mm, robot_y_mm, rx, ry)) return;
+
+  float baseTheta = headingToThetaRad(heading);
+
+  for (int i = 0; i < 720; i += BEAM_STEP) {
+    float r = scan720[i];
+    if (r < LIDAR_MIN_MM || r > LIDAR_MAX_MM) continue;
+
+    // your convention: index 360 is "front"
+    float beamDeg = (float)(i - 360) * 0.5f;   // 0 deg = forward
+    float ang = baseTheta + beamDeg * DEG_TO_RAD;
+
+    bool hit = (r < (LIDAR_MAX_MM - NO_HIT_MARGIN_MM)); // max distance we define 
+
+    float ex = robot_x_mm + r * cosf(ang);
+    float ey = robot_y_mm + r * sinf(ang);
+
+    int gx, gy;
+    if (!worldToGrid(ex, ey, gx, gy)) {
+      // If endpoint is out of map, clip it inward and treat as "no hit"
+      float r2 = r;
+      bool ok = false;
+      for (int k = 0; k < 10; k++) {
+        r2 *= 0.85f;
+        ex = robot_x_mm + r2 * cosf(ang);
+        ey = robot_y_mm + r2 * sinf(ang);
+        if (worldToGrid(ex, ey, gx, gy)) { ok = true; break; }
+      }
+      if (!ok) continue;
+      hit = false;
+    }
+
+    updateRay(rx, ry, gx, gy, hit);
+  }
+}
 
 void updateHeading(int turn) {
     if (turn == 90)      heading = (Heading)((heading + 1) % 4);
@@ -59,6 +210,24 @@ bool isNewPath(bool openRight, bool openFront, bool openLeft) {
 
 
 void sendControlCommand(int8_t X, int8_t Y, uint8_t A) {
+    unsigned long now = millis();
+    if (lastCmdTime == 0) lastCmdTime = now;
+
+    // integrate translation using LAST commanded Y over elapsed time
+    unsigned long dt = now - lastCmdTime;
+    if (dt > 0 && lastCmdY != 0) {
+        float mmPerMs = (lastCmdY > 0) ? MM_PER_MS_FWD : MM_PER_MS_REV;
+        float dist = mmPerMs * (float)dt * (float)lastCmdY; // signed
+
+        float theta = headingToThetaRad(heading);
+        robot_x_mm += dist * cosf(theta);
+        robot_y_mm += dist * sinf(theta);
+    }
+
+    lastCmdTime = now;
+    lastCmdY = Y;
+
+    // your original motor command
     lidarcar.ControlWheel(X, Y, A);
 }
 
@@ -265,7 +434,7 @@ void drawLidarMap() {
     }
 }
 
-
+// TODO tunning
 int turnDuration90Right = 2200;
 int turnDuration90Left = 2200;
 int turnDuration180 = 4300;
@@ -482,8 +651,20 @@ void mazeDrive() {
 
 
 static void mazeTask(void *arg) {
+    static float scanSnap[720];
+
     while (1) {
         if (mazeMode && !mazeSolved) {
+
+            // Snapshot scan safely
+            portENTER_CRITICAL(&lidarMux);
+            for (int i = 0; i < 720; i++) scanSnap[i] = lidar.tmpmap.mapdata[i];
+            portEXIT_CRITICAL(&lidarMux);
+
+            // Update occupancy grid map (log-odds)
+            updateMapFromScan(scanSnap);
+
+            // Your existing pipeline
             drawLidarMap();
             detectMazeFeature();
             mazeDrive();
@@ -501,9 +682,11 @@ static void lidarTask(void *arg) {
 
         cleanLidarData(lidar.tmpmap.mapdata, cleanedMap);
 
+        portENTER_CRITICAL(&lidarMux);
         for (int i = 0; i < 720; i++) {
             lidar.tmpmap.mapdata[i] = cleanedMap[i];
         }
+        portEXIT_CRITICAL(&lidarMux);
 
         delay(5);
     }
@@ -579,6 +762,17 @@ void setup() {
     M5.Lcd.setCursor(3, 10);
     M5.Lcd.println("X2 LidarBot");
     M5.Lcd.println("Ready");
+    LO_OCC_DELTA  = probToLogOddsDelta(P_OCC);
+    LO_FREE_DELTA = probToLogOddsDelta(P_FREE);
+
+    for (int y = 0; y < MAP_H; y++)
+    for (int x = 0; x < MAP_W; x++)
+        logOdds[y][x] = 0; // prior p=0.5 => l0=0
+
+    robot_x_mm = 0.0f;
+    robot_y_mm = 0.0f;
+    lastCmdTime = 0;
+    lastCmdY = 0;
 
     xTaskCreatePinnedToCore(lidarTask, "lidar_task", 8192, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(mazeTask, "maze_task", 8192, NULL, 1, NULL, 0);
